@@ -26,7 +26,7 @@ MAX_MESSAGES = 20  # the most messages one visitor can send in a chat
 load_dotenv()
 client = openai.OpenAI(
     base_url="https://openrouter.ai/api/v1",
-    api_key=os.environ["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"],
+    api_key="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",
 )
 
 st.title(TITLE)
