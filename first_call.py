@@ -16,7 +16,7 @@ MODEL = "google/gemma-4-26b-a4b-it:floor"
 load_dotenv()
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
-    api_key="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",
+    api_key=os.environ["OPENROUTER_API_KEY"],
 )
 
 # The conversation is a list of messages. The system message sets the
