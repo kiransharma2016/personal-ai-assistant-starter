@@ -4,13 +4,16 @@ Run it from the terminal:
     streamlit run streamlit_app.py
 """
 
+import ast
 import base64
 import io
 import json
+import operator
 import os
 import re
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo, available_timezones
 
 import openai
 import streamlit as st
@@ -41,19 +44,20 @@ Rules you must always follow:
 """
 
 # ---------- Settings ----------
-# label: (OpenRouter model id, can it read images?)
+# label: (OpenRouter model id, can it read images?, can it call tools?)
 # Prices are per million tokens (input / output), checked on OpenRouter Nov 2026.
 MODELS = {
-    "Gemma 4 26B · $0.09 / $0.30 (default)": ("google/gemma-4-26b-a4b-it:floor", True),
-    "Gemma 4 31B · FREE (rate-limited)": ("google/gemma-4-31b-it:free", True),
-    "GPT-OSS 20B · $0.02 · cheapest": ("openai/gpt-oss-20b", False),
-    "Llama 3.1 8B · $0.02 · tiny & fast": ("meta-llama/llama-3.1-8b-instruct", False),
-    "Phi-4 · $0.07 / $0.14": ("microsoft/phi-4", False),
-    "Mistral Small 3.2 · $0.08 / $0.20": ("mistralai/mistral-small-3.2-24b-instruct", True),
-    "Gemini 2.5 Flash Lite · $0.10 / $0.40": ("google/gemini-2.5-flash-lite", True),
-    "GPT-4o mini · $0.15 / $0.60": ("openai/gpt-4o-mini", True),
-    "DeepSeek V3.1 · $0.25 / $0.95 (smart)": ("deepseek/deepseek-chat-v3.1", False),
+    "Gemma 4 26B · $0.09 / $0.30 (default)": ("google/gemma-4-26b-a4b-it:floor", True, True),
+    "Gemma 4 31B · FREE (rate-limited)": ("google/gemma-4-31b-it:free", True, True),
+    "GPT-OSS 20B · $0.02 · cheapest": ("openai/gpt-oss-20b", False, True),
+    "Llama 3.1 8B · $0.02 · tiny & fast": ("meta-llama/llama-3.1-8b-instruct", False, True),
+    "Phi-4 · $0.07 / $0.14": ("microsoft/phi-4", False, False),
+    "Mistral Small 3.2 · $0.08 / $0.20": ("mistralai/mistral-small-3.2-24b-instruct", True, True),
+    "Gemini 2.5 Flash Lite · $0.10 / $0.40": ("google/gemini-2.5-flash-lite", True, True),
+    "GPT-4o mini · $0.15 / $0.60": ("openai/gpt-4o-mini", True, True),
+    "DeepSeek V3.1 · $0.25 / $0.95 (smart)": ("deepseek/deepseek-chat-v3.1", False, True),
 }
+MAX_AGENT_STEPS = 5      # the agent loop's brake: at most this many model calls per message
 FALLBACK_MODEL = "google/gemma-4-26b-a4b-it:floor"  # used if the chosen model fails
 
 MAX_REPLY_TOKENS = 500   # the longest reply allowed, in tokens
@@ -173,6 +177,81 @@ def read_file(uploaded) -> tuple[str, str]:
     return "text", text[:MAX_FILE_CHARS]
 
 
+# ---------- Part 3b: tools for Agent mode ----------
+# The model never runs these. It asks for a tool by name with JSON arguments,
+# OUR code runs the function, and we send the result back. That's all tool calling is.
+_OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv,
+        ast.Pow: operator.pow, ast.Mod: operator.mod, ast.FloorDiv: operator.floordiv, ast.USub: operator.neg,
+        ast.UAdd: operator.pos}
+
+
+def calculator(expression: str) -> str:
+    """Safe arithmetic: numbers and + - * / // % ** only (no eval)."""
+    def walk(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in _OPS:
+            if isinstance(node.op, ast.Pow) and abs(walk(node.right)) > 100:
+                raise ValueError("exponent too large")
+            return _OPS[type(node.op)](walk(node.left), walk(node.right))
+        if isinstance(node, ast.UnaryOp) and type(node.op) in _OPS:
+            return _OPS[type(node.op)](walk(node.operand))
+        raise ValueError("only numbers and + - * / // % ** are allowed")
+    try:
+        return str(round(walk(ast.parse(expression.replace("^", "**"), mode="eval").body), 10))
+    except Exception as error:  # the model reads this message and can fix its input
+        return f"Error: {error}"
+
+
+CITY_ZONES = {"kathmandu": "Asia/Kathmandu", "new york": "America/New_York", "london": "Europe/London",
+              "san francisco": "America/Los_Angeles", "sydney": "Australia/Sydney", "tokyo": "Asia/Tokyo",
+              "delhi": "Asia/Kolkata", "dubai": "Asia/Dubai", "toronto": "America/Toronto"}
+
+
+def get_time(place: str) -> str:
+    """Current date and time for a city or an IANA time zone like Europe/Paris."""
+    zone = CITY_ZONES.get(place.strip().lower(), place.strip())
+    if zone not in available_timezones():
+        return f"Error: unknown place '{place}'. Use an IANA time zone such as Asia/Kathmandu."
+    return datetime.now(ZoneInfo(zone)).strftime(f"%A %d %B %Y, %H:%M ({zone})")
+
+
+def search_memory(query: str) -> str:
+    """Look through the facts the user asked us to remember."""
+    words = {w for w in re.findall(r"\w+", query.lower()) if len(w) > 2}
+    hits = [f for f in st.session_state.memories if words & set(re.findall(r"\w+", f.lower()))]
+    return "\n".join(hits) if hits else "No matching memories."
+
+
+TOOLS = {"calculator": calculator, "get_time": get_time, "search_memory": search_memory}
+TOOL_SPECS = [  # what the model is told about each tool: a name, a description and a JSON schema
+    {"type": "function", "function": {
+        "name": "calculator", "description": "Do exact arithmetic. Use it for any maths instead of guessing.",
+        "parameters": {"type": "object", "properties": {
+            "expression": {"type": "string", "description": "e.g. (1250*0.18)+40"}}, "required": ["expression"]}}},
+    {"type": "function", "function": {
+        "name": "get_time", "description": "Get the current date and time in a city or time zone.",
+        "parameters": {"type": "object", "properties": {
+            "place": {"type": "string", "description": "City name or IANA zone, e.g. Kathmandu or Europe/Paris"}},
+            "required": ["place"]}}},
+    {"type": "function", "function": {
+        "name": "search_memory", "description": "Search the facts the user saved in memory about themselves.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Keywords to look for"}}, "required": ["query"]}}},
+]
+
+
+def run_tool(name: str, arguments: str) -> str:
+    """Run one tool call from the model. Bad names or arguments become error text the model can read."""
+    if name not in TOOLS:
+        return f"Error: there is no tool called {name}."
+    try:
+        args = json.loads(arguments or "{}")
+        return str(TOOLS[name](**args))[:2000]
+    except (ValueError, TypeError) as error:
+        return f"Error: bad arguments for {name}: {error}"
+
+
 # ---------- Part 4: connect ----------
 # On your Codespace, the key comes from .env. Once deployed, it comes
 # from the app's secrets. Either way, it never appears in this file.
@@ -190,19 +269,41 @@ if not api_key:
 client = openai.OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
 
 
-def ask_model(model_id: str, messages: list, temperature: float):
+def ask_model(model_id: str, messages: list, temperature: float, tools: list | None = None):
     """Call the chosen model; if it fails (rate limit, not available), try the default model once."""
+    extra = {"tools": tools} if tools else {}
     try:
-        return client.chat.completions.create(model=model_id, messages=messages,
-                                              max_tokens=MAX_REPLY_TOKENS, temperature=temperature), model_id
+        return client.chat.completions.create(model=model_id, messages=messages, max_tokens=MAX_REPLY_TOKENS,
+                                              temperature=temperature, **extra), model_id
     except openai.AuthenticationError:
         raise
     except openai.APIError as error:
         if model_id == FALLBACK_MODEL:
             raise
         st.toast(f"{model_id} is busy or unavailable ({getattr(error, 'status_code', '?')}). Using the default model.", icon="🔁")
-        return client.chat.completions.create(model=FALLBACK_MODEL, messages=messages,
-                                              max_tokens=MAX_REPLY_TOKENS, temperature=temperature), FALLBACK_MODEL
+        return client.chat.completions.create(model=FALLBACK_MODEL, messages=messages, max_tokens=MAX_REPLY_TOKENS,
+                                              temperature=temperature, **extra), FALLBACK_MODEL
+
+
+def agent_loop(model_id: str, messages: list, temperature: float, steps_box) -> tuple[str, int, list]:
+    """The whole idea of an AI agent: call the model, run any tools it asks for, repeat until it answers.
+
+    Returns (reply, tokens used, a log of the tool calls)."""
+    tokens, log = 0, []
+    for step in range(1, MAX_AGENT_STEPS + 1):
+        response, model_id = ask_model(model_id, messages, temperature, tools=TOOL_SPECS)
+        tokens += response.usage.total_tokens if response.usage else 0
+        msg = response.choices[0].message
+        if not msg.tool_calls:                       # no tool requested: this is the final answer
+            return msg.content or "(The model sent back an empty reply.)", tokens, log
+        messages.append({"role": "assistant", "content": msg.content or "",
+                         "tool_calls": [c.model_dump() for c in msg.tool_calls]})
+        for call in msg.tool_calls:                  # our code runs each tool, never the model
+            result = run_tool(call.function.name, call.function.arguments)
+            log.append({"step": step, "tool": call.function.name, "args": call.function.arguments, "result": result})
+            steps_box.markdown(f"**Step {step}** · `{call.function.name}({call.function.arguments})` → {result}")
+            messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+    return f"I stopped after {MAX_AGENT_STEPS} steps without a final answer (that's the safety brake).", tokens, log
 
 
 # ---------- Look and feel ----------
@@ -259,9 +360,14 @@ with st.sidebar:
     persona = st.selectbox("Personality", list(PERSONAS))
     model_label = st.selectbox("Model", list(MODELS), help="Cheaper models are faster but less clever. "
                                "If a model is busy, the app switches to the default automatically.")
-    model_id, model_sees_images = MODELS[model_label]
+    model_id, model_sees_images, model_uses_tools = MODELS[model_label]
     temperature = st.slider("Creativity", 0.0, 1.5, 0.7, 0.1,
                             help="Low = focused and predictable. High = more creative.")
+    agent_mode = st.toggle("🔧 Agent mode (tools)", value=False,
+                           help="Lets the model use tools (calculator, world clock, memory search) in a loop. "
+                                "You'll see every step it takes.")
+    if agent_mode and not model_uses_tools:
+        st.caption(f"⚠️ {model_label.split(' · ')[0]} can't use tools, so Agent mode uses the default model.")
     use_ai_check = st.toggle("AI safety check", value=True,
                              help="Asks a small model to double-check each message. Safer, slightly slower.")
 
@@ -325,6 +431,7 @@ st.markdown(f"""
   <span class="badge">{PERSONA_ICONS[persona]} {persona}</span>
   <span class="badge">🧠 {model_label.split(' · ')[0]}</span>
   <span class="badge">🛡️ Guardrails on</span>
+  {'<span class="badge">🔧 Agent mode</span>' if agent_mode else ''}
   {'<span class="badge">💭 ' + str(len(st.session_state.memories)) + ' memories</span>' if st.session_state.memories else ''}
 </div>
 """, unsafe_allow_html=True)
@@ -341,6 +448,10 @@ if not st.session_state.messages and "notice" not in st.session_state:
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"], avatar=AVATARS[message["role"]]):
+        if message.get("steps"):
+            with st.expander(f"🔧 {len(message['steps'])} tool call(s)"):
+                for s in message["steps"]:
+                    st.markdown(f"**Step {s['step']}** · `{s['tool']}({s['args']})` → {s['result']}")
         st.write(message["content"])
         for name in message.get("files", []):
             st.caption(f"📎 {name}")
@@ -427,11 +538,20 @@ if user_text or files:
     # Earlier turns are sent as plain text (files and images only go with the turn they were attached to)
     history = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages[-HISTORY_TO_SEND:-1]]
     history.append({"role": "user", "content": this_turn})
+    steps, tokens = [], 0
     try:
         with st.chat_message("assistant", avatar=AVATARS["assistant"]):
-            with st.spinner("Thinking..."):
-                response, used_model = ask_model(model_id, [{"role": "system", "content": system_prompt}] + history, temperature)
-            reply = response.choices[0].message.content or "(The model sent back an empty reply.)"
+            convo = [{"role": "system", "content": system_prompt}] + history
+            if agent_mode:
+                with st.status("🔧 Agent working…", expanded=True) as status:
+                    reply, tokens, steps = agent_loop(model_id if model_uses_tools else FALLBACK_MODEL,
+                                                      convo, temperature, status)
+                    status.update(label=f"🔧 Done · {len(steps)} tool call(s)", state="complete", expanded=False)
+            else:
+                with st.spinner("Thinking..."):
+                    response, used_model = ask_model(model_id, convo, temperature)
+                reply = response.choices[0].message.content or "(The model sent back an empty reply.)"
+                tokens = response.usage.total_tokens if response.usage else 0
             reply = check_output(reply, system_prompt)  # Guardrail 3: check the reply before showing it
             st.write(reply)
     except openai.AuthenticationError:
@@ -443,7 +563,6 @@ if user_text or files:
         st.error(f"Couldn't get a reply from the model: {error}")
         st.stop()
 
-    if response.usage:
-        st.session_state.tokens_used += response.usage.total_tokens
-    st.session_state.messages.append({"role": "assistant", "content": reply})
+    st.session_state.tokens_used += tokens
+    st.session_state.messages.append({"role": "assistant", "content": reply, "steps": steps})
     st.rerun()  # refresh the sidebar counters
